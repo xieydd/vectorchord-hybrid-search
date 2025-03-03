@@ -1,0 +1,7 @@
+tqdm
+psycopg2[binary]
+pytrec_eval
+requests
+numpy
+pgvector
+FlagEmbedding
