@@ -236,7 +236,7 @@ class PgClient:
         return sorted_results
 
 
-def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim, limit):
+def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim, limit, only_vector, only_bm25):
     data_path = download_and_unzip(BASE_URL.format(dataset), save_dir)
     split = "dev" if dataset == "msmarco" else "test"
     corpus, query, qrels = GenericDataLoader(data_folder=data_path).load(split=split)
@@ -270,14 +270,14 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
     )
 
     client = PgClient(db_config, dataset, num_doc, vector_dim)
-    # client.create()
-    # client.insert(corpus_ids, corpus_text, qids, query_text)
-    # client.index(int(len(os.sched_getaffinity(0)) * 0.8))
+    client.create()
+    client.insert(corpus_ids, corpus_text, qids, query_text)
+    client.index(int(len(os.sched_getaffinity(0)) * 0.8))
     vector_result = client.query(topk)
     bm25_results = client.query_bm25(topk)
     format_results = {}
 
-    if not args.only_vector and not args.only_bm25:
+    if not only_vector and not only_bm25:
         for qid, cid, score in vector_result+bm25_results:
             key = str(qid)
             if key not in format_results:
@@ -285,14 +285,14 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
             format_results[key][str(cid)] = float(score)
         format_results = client.rrf([vector_result, bm25_results], k=60)
     
-    if args.only_vector:
+    if only_vector:
         for qid, cid, score in vector_result:
             key = str(qid)
             if key not in format_results:
                 format_results[key] = {}
             format_results[key][str(cid)] = float(score)
 
-    if args.only_bm25:
+    if only_bm25:
         for qid, cid, score in bm25_results:
             key = str(qid)
             if key not in format_results:
