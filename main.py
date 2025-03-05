@@ -152,7 +152,15 @@ class PgClient:
                 )
             
             cursor.execute(
-                f"UPDATE {self.dataset}_corpus SET bm25 = tokenize(text, 'Bert')"
+                f"SELECT create_tokenizer('{self.dataset}_token', $$",
+                f"tokenizer = 'unicode'",
+                f"stopwords = 'nltk'",
+                f"table = '{self.dataset}_corpus'",
+                f"column = 'text'",
+                f"$$);"
+            )
+            cursor.execute(
+                f"UPDATE {self.dataset}_corpus SET bm25 = tokenize(text, '{self.dataset}_token')"
             )
 
         logger.info(
@@ -203,7 +211,7 @@ class PgClient:
         with self.conn.cursor() as cursor:
             cursor.execute(
                 f"SELECT q.id AS qid, c.id, c.score FROM {self.dataset}_query q, LATERAL ("
-                f"SELECT id, {self.dataset}_corpus.bm25 <&> to_bm25query('{self.dataset}_text_bm25', q.text , 'Bert') AS score "
+                f"SELECT id, {self.dataset}_corpus.bm25 <&> to_bm25query('{self.dataset}_text_bm25', q.text , '{self.dataset}_token') AS score "
                 f"FROM {self.dataset}_corpus "
                 f"ORDER BY score "
                 f"LIMIT {topk}) c;"
@@ -270,19 +278,14 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
     )
 
     client = PgClient(db_config, dataset, num_doc, vector_dim)
-    client.create()
-    client.insert(corpus_ids, corpus_text, qids, query_text)
-    client.index(int(len(os.sched_getaffinity(0)) * 0.8))
+    # client.create()
+    # client.insert(corpus_ids, corpus_text, qids, query_text)
+    # client.index(int(len(os.sched_getaffinity(0)) * 0.8))
     vector_result = client.query(topk)
     bm25_results = client.query_bm25(topk)
     format_results = {}
 
     if not only_vector and not only_bm25:
-        for qid, cid, score in vector_result+bm25_results:
-            key = str(qid)
-            if key not in format_results:
-                format_results[key] = {}
-            format_results[key][str(cid)] = float(score)
         format_results = client.rrf([vector_result, bm25_results], k=60)
     
     if only_vector:
@@ -297,7 +300,7 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
             key = str(qid)
             if key not in format_results:
                 format_results[key] = {}
-            format_results[key][str(cid)] = float(score)
+            format_results[key][str(cid)] = -float(score)
 
     os.makedirs("results", exist_ok=True)
     with open(f"results/vectorchord_{dataset}.json", "w") as f:
