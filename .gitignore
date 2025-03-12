@@ -9,3 +9,5 @@ datasets/
 # Resutls
 *.json
 results/
+
+*.log

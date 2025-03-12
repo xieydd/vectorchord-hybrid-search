@@ -1,6 +1,7 @@
 from loader import GenericDataLoader
 from evaluate import EvaluateRetrieval
 from embedding import SentenceEmbedding
+from FlagEmbedding import FlagReranker
 
 import argparse
 import os
@@ -104,6 +105,7 @@ def build_parser():
     parser.add_argument("--limit", type=int, default=None, help="Limit the number of documents to process")
     parser.add_argument("--only-vector", action="store_true", help="Only use vector search")
     parser.add_argument("--only-bm25", action="store_true", help="Only use bm25 search")
+    parser.add_argument("--distance", default="cosine", choices=["cosine", "euclidean", "dot"])
     return parser
 
 
@@ -167,40 +169,69 @@ class PgClient:
             "insert %s in %f seconds", self.dataset, perf_counter() - start_time
         )
 
-    def index(self, workers: int):
+    def index(self, workers: int, distance: str):
         start_time = perf_counter()
         centroids = min(4 * int(self.num**0.5), self.num // 40)
+        
+        if distance == "euclidean":
+            ops = "vector_l2_ops"
+            spherical_centroids = "false"
+        elif distance == "cosine":
+            ops = "vector_cosine_ops"
+            spherical_centroids = "true"
+        else:
+            ops = "vector_ip_ops"
+            spherical_centroids = "true"
         ivf_config = f"""
         residual_quantization = true
         [build.internal]
         lists = [{centroids}]
         build_threads = {workers}
-        spherical_centroids = false
+        spherical_centroids = {spherical_centroids} 
         """
         with self.conn.cursor() as cursor:
             cursor.execute(f"SET max_parallel_maintenance_workers TO {workers}")
             cursor.execute(f"SET max_parallel_workers TO {workers}")
             cursor.execute(
-                f"CREATE INDEX {self.dataset}_rabitq ON {self.dataset}_corpus USING vchordrq (emb vector_l2_ops) WITH (options = $${ivf_config}$$)"
+                f"CREATE INDEX {self.dataset}_rabitq ON {self.dataset}_corpus USING vchordrq (emb {ops}) WITH (options = $${ivf_config}$$)"
             )
 
-            # Create a BM25 index
-            cursor.execute(
-                f"CREATE INDEX {self.dataset}_text_bm25 ON {self.dataset}_corpus USING bm25 (bm25 bm25_ops)"
-            )
+            # # Create a BM25 index
+            # cursor.execute(
+            #     f"CREATE INDEX {self.dataset}_text_bm25 ON {self.dataset}_corpus USING bm25 (bm25 bm25_ops)"
+            # )
 
         logger.info("build index takes %f seconds", perf_counter() - start_time)
 
-    def query(self, topk: int):
+    def query(self, topk: int, distance: str):
         probe = int(0.1 * min(4 * int(self.num**0.5), self.num // 40))
         with self.conn.cursor() as cursor:
             cursor.execute(f"SET vchordrq.probes = {probe}")
         start_time = perf_counter()
+        if distance == "euclidean":
+            ops = "<->"
+        elif distance == "cosine":
+            ops = "<=>"
+        else:
+            ops = "<#>"
         with self.conn.cursor() as cursor:
+            query = f"""
+            WITH ranked_results AS (
+                SELECT q.id AS qid, c.id, c.score
+                FROM {self.dataset}_query q, 
+                LATERAL (
+                    SELECT id, {self.dataset}_corpus.emb {ops} q.emb AS score 
+                    FROM {self.dataset}_corpus 
+                    ORDER BY score
+                    LIMIT {topk}
+                ) c
+            )
+            SELECT qid, id, score
+            FROM ranked_results
+            ORDER BY qid, score DESC;
+            """
             cursor.execute(
-                f"select q.id as qid, c.id, c.score from {self.dataset}_query q, lateral ("
-                f"select id, {self.dataset}_corpus.emb <-> q.emb as score from "
-                f"{self.dataset}_corpus order by score limit {topk}) c;"
+                query
             )
             res = cursor.fetchall()
         logger.info("query takes %f seconds", perf_counter() - start_time)
@@ -220,31 +251,75 @@ class PgClient:
         logger.info("query bm25 takes %f seconds", perf_counter() - start_time)
         return res
 
-    def rrf(self, results, k: int = 60):
+    def rrf(self, vector_results,bm25_results,topk: int, k: int = 60):
         start_time = perf_counter()
         rrf_scores = {}
+
+        sorted_vector_results = {}
+        for query_id, docs in vector_results.items():
+            sorted_vector_results[str(query_id)] = dict(sorted(docs.items(), key=lambda x: x[1], reverse=True))
+
+        sorted_bm25_results = {} 
+        for query_id, docs in bm25_results.items():
+            sorted_bm25_results[str(query_id)] = dict(sorted(docs.items(), key=lambda x: x[1], reverse=True))
+
+        results = [sorted_vector_results, sorted_bm25_results]
 
         # Iterate through each ranking system
         for result in results:
             # Iterate through each document and its rank in current system
-            for rank, (query_id, doc_id, _) in enumerate(result, start=1):
-                if query_id not in rrf_scores:
-                    rrf_scores[query_id] = {}
-                if doc_id not in rrf_scores[query_id]:
-                    rrf_scores[query_id][doc_id] = 0
-                # Calculate and accumulate RRF scores
-                rrf_scores[query_id][doc_id] += 1 / (k + rank)
+            for query_id, docs in result.items():
+                for rank, (doc_id, _) in enumerate(docs.items(), start=1):
+                    if query_id not in rrf_scores:
+                        rrf_scores[query_id] = {}
+                    if doc_id not in rrf_scores[query_id]:
+                        rrf_scores[query_id][doc_id] = 0
+                    # Calculate and accumulate RRF scores
+                    rrf_scores[query_id][doc_id] += 1 / (k + rank)
 
         # Sort docs by RRF scores in descending order for each query
         sorted_results = {}
         for query_id, docs in rrf_scores.items():
-            sorted_results[str(query_id)] = dict(sorted(docs.items(), key=lambda x: x[1], reverse=True))
-
+            sorted_results[str(query_id)] = dict(sorted(docs.items(), key=lambda x: x[1], reverse=True)[:topk])
+        
         logger.info("rrf rerank takes %f seconds", perf_counter() - start_time)
         return sorted_results
 
+    def CorssEncoderReranker(self, results, documents, querys, model: str = "BAAI/bge-reranker-v2-m3"):
+        start_time = perf_counter()
+        bge_scores = {}
+        def get_key_from_value(d, target_value):
+            return next((v for k, v in d.items() if k == target_value), None)
 
-def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim, limit, only_vector, only_bm25):
+        reranker = FlagReranker(
+            'BAAI/bge-reranker-v2-m3', 
+            query_max_length=256,
+            passage_max_length=512,
+            use_fp16=True,
+            devices=["cuda:0"] # change ["cpu"] if you do not have gpu, but it will be very slow
+        ) # Setting use_fp16 to True speeds up computation with a slight performance degradation
+
+        for query_id, docs in tqdm(results.items()):
+            pairs = []
+            for doc_id in docs:
+                if query_id not in bge_scores:
+                    bge_scores[query_id] = {}
+                val = get_key_from_value(documents, doc_id)
+                pairs.append([get_key_from_value(querys, query_id), val["title"] + " " + val["text"]])
+            scores = reranker.compute_score(pairs, normalize=True) 
+            for i, doc_id in enumerate(docs):
+                bge_scores[query_id][doc_id] = scores[i]
+
+        # Sort docs by BGE scores in descending order for each query
+        sorted_results = {}
+        for query_id, docs in bge_scores.items():
+            sorted_results[str(query_id)] = dict(sorted(docs.items(), key=lambda x: x[1], reverse=True))
+
+        logger.info("bge rerank takes %f seconds", perf_counter() - start_time)
+        return sorted_results
+
+
+def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim, limit, only_vector, only_bm25, distance):
     data_path = download_and_unzip(BASE_URL.format(dataset), save_dir)
     split = "dev" if dataset == "msmarco" else "test"
     corpus, query, qrels = GenericDataLoader(data_folder=data_path).load(split=split)
@@ -256,7 +331,6 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
             break
         corpus_ids.append(key)
         corpus_text.append(val["title"] + " " + val["text"])
-    del corpus
 
     qids, query_text = [], []
     for i, (key, val) in enumerate(query.items()):
@@ -264,7 +338,6 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
             break
         qids.append(key)
         query_text.append(val)
-    del query
 
     num_doc = len(corpus_ids) if limit else num_doc
     logger.info("Corpus: %d, query: %d", num_doc, len(qids))
@@ -280,31 +353,67 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
     client = PgClient(db_config, dataset, num_doc, vector_dim)
     # client.create()
     # client.insert(corpus_ids, corpus_text, qids, query_text)
-    # client.index(int(len(os.sched_getaffinity(0)) * 0.8))
-    vector_result = client.query(topk)
+    # client.index(int(len(os.sched_getaffinity(0)) * 0.8), distance)
+    vector_results = client.query(topk, distance)
     bm25_results = client.query_bm25(topk)
-    format_results = {}
 
-    if not only_vector and not only_bm25:
-        format_results = client.rrf([vector_result, bm25_results], k=60)
+    format_vector_results = {}
+    for qid, cid, score in vector_results:
+        key = str(qid)
+        if key not in format_vector_results:
+            format_vector_results[key] = {}
+        # in vectorchord, cosine distance score = 1 - distance
+        # need recovery
+        format_vector_results[key][str(cid)] = 1-float(score)
     
+    format_bm25_results = {}
+    for qid, cid, score in bm25_results:
+        key = str(qid)
+        if key not in format_bm25_results:
+            format_bm25_results[key] = {}
+        # in vectorchord-bm25, score = - (real score)
+        # need recovery
+        format_bm25_results[key][str(cid)] = -float(score)
+
+    merged_results = {}
+
+    for qid, cid, _ in vector_results:
+        key = str(qid)
+        if key not in merged_results:
+            merged_results[key] = set()
+        merged_results[key].add(str(cid))
+
+    for qid, cid, _ in bm25_results:
+        key = str(qid)
+        if key not in merged_results:
+            merged_results[key] = set()
+        merged_results[key].add(str(cid))
+
+    def get_key_from_value(d, target_value):
+        return next((v for k, v in d.items() if k == target_value), None)
+    
+    if not only_vector and not only_bm25:
+        format_results = client.CorssEncoderReranker(merged_results, corpus, query, topk)
+
+    # if not only_vector and not only_bm25:
+    #     format_results = client.rrf(format_vector_results, format_bm25_results,topk, k=6)
+
     if only_vector:
-        for qid, cid, score in vector_result:
-            key = str(qid)
-            if key not in format_results:
-                format_results[key] = {}
-            format_results[key][str(cid)] = float(score)
-
+        format_results = format_vector_results
     if only_bm25:
-        for qid, cid, score in bm25_results:
-            key = str(qid)
-            if key not in format_results:
-                format_results[key] = {}
-            format_results[key][str(cid)] = -float(score)
-
+        format_results = format_bm25_results
+    
     os.makedirs("results", exist_ok=True)
-    with open(f"results/vectorchord_{dataset}.json", "w") as f:
+    with open(f"results/vectorchord_score_{dataset}.json", "w") as f:
         json.dump(format_results, f, indent=2)
+    
+    # format_text_results = {}
+    
+    # for qid, docs in format_results.items():
+    #     format_text_results[get_key_from_value(query,qid)] = [(doc_id, get_key_from_value(corpus,doc_id)) for doc_id, _ in docs.items()] 
+    # with open(f"results/vectorchord_text_{dataset}.json", "w") as f:
+    #     json.dump(format_text_results, f, indent=2)
+    del corpus, query
 
     ndcg, _map, recall, precision = EvaluateRetrieval.evaluate(
         qrels, format_results, [1, 10, 100, 1000]
