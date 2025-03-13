@@ -91,7 +91,7 @@ class DBConfig:
 def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-d", "--dataset", default="fiqa", choices=["fiqa", "msmarco", "quora"]
+        "-d", "--dataset", default="fiqa", choices=["fiqa", "msmarco", "quora","scidocs","scifact","trec-covid"]
     )
     parser.add_argument("-k", "--topk", default=10, type=int)
     parser.add_argument("-s", "--save_dir", default="datasets")
@@ -153,14 +153,13 @@ class PgClient:
                     (qid, query, emb),
                 )
             
-            cursor.execute(
-                f"SELECT create_tokenizer('{self.dataset}_token', $$",
-                f"tokenizer = 'unicode'",
-                f"stopwords = 'nltk'",
-                f"table = '{self.dataset}_corpus'",
-                f"column = 'text'",
-                f"$$);"
-            )
+            query = f"""SELECT create_tokenizer('{self.dataset}_token', $$
+                tokenizer = 'unicode'
+                stopwords = 'nltk'
+                table = '{self.dataset}_corpus'
+                column = 'text'
+                $$);"""
+            cursor.execute(query)
             cursor.execute(
                 f"UPDATE {self.dataset}_corpus SET bm25 = tokenize(text, '{self.dataset}_token')"
             )
@@ -196,10 +195,10 @@ class PgClient:
                 f"CREATE INDEX {self.dataset}_rabitq ON {self.dataset}_corpus USING vchordrq (emb {ops}) WITH (options = $${ivf_config}$$)"
             )
 
-            # # Create a BM25 index
-            # cursor.execute(
-            #     f"CREATE INDEX {self.dataset}_text_bm25 ON {self.dataset}_corpus USING bm25 (bm25 bm25_ops)"
-            # )
+            # Create a BM25 index
+            cursor.execute(
+                f"CREATE INDEX {self.dataset}_text_bm25 ON {self.dataset}_corpus USING bm25 (bm25 bm25_ops)"
+            )
 
         logger.info("build index takes %f seconds", perf_counter() - start_time)
 
@@ -392,6 +391,7 @@ def main(dataset, topk, save_dir, dbname, user, password, host, port, vector_dim
     def get_key_from_value(d, target_value):
         return next((v for k, v in d.items() if k == target_value), None)
     
+    # cross-encoder reranker
     if not only_vector and not only_bm25:
         format_results = client.CorssEncoderReranker(merged_results, corpus, query, topk)
 
